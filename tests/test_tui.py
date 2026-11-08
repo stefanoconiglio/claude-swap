@@ -1366,6 +1366,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_weeklies: list[float] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1382,6 +1383,12 @@ class _FakeEngine:
     def apply_threshold(self, threshold: float) -> None:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
+
+    def apply_weekly_threshold(self, weekly_threshold) -> None:
+        self.settings = dataclasses.replace(
+            self.settings, weekly_threshold=weekly_threshold
+        )
+        self.applied_weeklies.append(weekly_threshold)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1546,6 +1553,167 @@ class TestAutoScreen:
             screen.action_threshold_step(-60.0)
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
+
+    @staticmethod
+    def _write_settings(tmp_path, autoswitch: dict, **sections) -> None:
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": autoswitch, **sections,
+        }))
+
+    @staticmethod
+    def _read_settings(tmp_path) -> dict:
+        import json as _json
+
+        return _json.loads((tmp_path / "settings.json").read_text())
+
+    @staticmethod
+    def _summary(screen) -> str:
+        from textual.widgets import Static
+
+        return screen.query_one("#auto-summary", Static).render().plain
+
+    @staticmethod
+    def _log(screen) -> str:
+        from textual.widgets import RichLog
+
+        return "\n".join(
+            line.text for line in screen.query_one("#event-log", RichLog).lines
+        )
+
+    async def test_weekly_adjust_is_session_only(self, tmp_path, fake_engine):
+        self._write_settings(tmp_path, {"threshold": 85, "weeklyThreshold": 97})
+        before = (tmp_path / "settings.json").read_text()
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("w", "right", "right", "right")
+            await pilot.pause()
+            assert screen._settings.weekly_threshold == 99.9  # spec's bound
+            assert screen._settings.threshold == 85.0  # untouched
+            assert app.weekly_threshold_pct == 99.9
+            engine = fake_engine.instances[0]
+            assert engine.applied_weeklies == [98.0, 99.0, 99.9]
+            assert engine.applied_thresholds == []
+            assert "weekly 99.9% (session)" in self._summary(screen)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert engine.wakes == 1
+            assert "weekly line set to 99.9% for this session" in self._log(screen)
+            assert (tmp_path / "settings.json").read_text() == before
+            await pilot.press("escape")
+            await settle(pilot)
+            # leaving the screen puts the weekly tick back on the file value
+            assert app.weekly_threshold_pct == 97.0
+
+    async def test_weekly_adjust_starts_from_the_threshold_when_unset(
+        self, tmp_path, fake_engine
+    ):
+        self._write_settings(tmp_path, {"threshold": 92})
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("w")
+            await pilot.pause()
+            assert "weekly = threshold" in self._summary(screen)
+            await pilot.press("left")
+            await pilot.pause()
+            assert screen._settings.weekly_threshold == 91.0
+            # t switches the arrows over to the threshold, ending weekly mode
+            await pilot.press("t", "right")
+            await pilot.pause()
+            assert screen._settings.threshold == 93.0
+            assert screen._settings.weekly_threshold == 91.0
+            await pilot.press("escape")  # leaves adjust mode
+            await pilot.press("escape")  # leaves the screen
+            await settle(pilot)
+            assert app.weekly_threshold_pct is None
+
+    async def test_save_lines_writes_both_after_confirmation(
+        self, tmp_path, fake_engine
+    ):
+        self._write_settings(
+            tmp_path,
+            {"threshold": 90, "intervalSeconds": 30},
+            ui={"theme": "dark"},
+        )
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "w", "left", "left")
+            await pilot.press("d")  # also leaves adjust mode
+            await pilot.pause()
+            from claude_swap.tui.modals import ConfirmModal
+
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("y")
+            await settle(pilot)
+            raw = self._read_settings(tmp_path)
+            assert raw["autoswitch"] == {
+                "threshold": 91.0, "intervalSeconds": 30, "weeklyThreshold": 89.0,
+            }
+            assert raw["ui"] == {"theme": "dark"}  # other sections survive
+            summary = self._summary(screen)
+            assert "(session)" not in summary
+            assert "threshold 91%" in summary and "weekly 89%" in summary
+            log = self._log(screen)
+            assert "saved threshold 91% · weekly 89% to settings.json" in log
+            assert "when restarted" in log
+            # nothing left to save: d says so instead of asking again
+            await pilot.press("d")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmModal)
+            assert "nothing to save" in self._log(screen)
+            await pilot.press("escape")
+            await settle(pilot)
+            # saved values are the file's now: leaving does not revert them
+            assert app.threshold_pct == 91.0
+            assert app.weekly_threshold_pct == 89.0
+
+    async def test_save_lines_cancel_writes_nothing(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "enter", "d")
+            await pilot.pause()
+            await pilot.press("n")
+            await settle(pilot)
+            assert not (tmp_path / "settings.json").exists()
+            assert "threshold 91% (session)" in self._summary(screen)
+
+    async def test_save_lines_reports_a_corrupt_settings_file(
+        self, tmp_path, fake_engine
+    ):
+        (tmp_path / "settings.json").write_text("{not json")
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t", "right", "enter", "d", "y")
+            await settle(pilot)
+            assert (tmp_path / "settings.json").read_text() == "{not json"
+            assert "threshold not saved" in self._log(screen)
+            assert "threshold 91% (session)" in self._summary(screen)
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(

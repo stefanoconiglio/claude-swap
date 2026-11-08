@@ -30,9 +30,15 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
+from claude_swap.exceptions import ConfigError
 from claude_swap.lines import binding_window
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    load_settings,
+    parse_model_names,
+    set_setting,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -67,9 +73,11 @@ class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("w", "adjust_weekly", "Weekly line"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
+        Binding("d", "save_lines", "Save lines"),
         Binding("escape,q", "back", "Back"),
     ]
 
@@ -79,14 +87,17 @@ class AutoScreen(Screen):
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
-        # Session-only threshold adjustment (t, then arrows). Never written
-        # to settings.json — same memory-only precedent as the dry-run
-        # toggle. ``_configured_threshold`` is the mount-time file value the
-        # screen reverts to on exit; ``_entry_threshold`` is the value when
-        # adjust mode was entered (wake/log only on a net change).
-        self._adjusting = False
+        # Session-only line adjustment (t for the threshold, w for the weekly
+        # line, then arrows). Nothing reaches settings.json until ``d`` saves
+        # it, confirmed — same memory-only precedent as the dry-run toggle.
+        # ``_configured_*`` are the file values the screen reverts to on exit
+        # (a save moves them); ``_entry_value`` is the value when adjust mode
+        # was entered (wake/log only on a net change). ``_adjusting`` names
+        # the line being adjusted: "threshold", "weekly" or None.
+        self._adjusting: str | None = None
         self._configured_threshold: float | None = None
-        self._entry_threshold: float | None = None
+        self._configured_weekly: float | None = None
+        self._entry_value: float | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -109,8 +120,8 @@ class AutoScreen(Screen):
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = self._settings.threshold
-        # The weekly line is not session-adjustable, so this is only the same
-        # sync-to-the-file correction; nothing to restore on unmount.
+        # Same for the weekly line's tick; unmount restores it too.
+        self._configured_weekly = self._settings.weekly_threshold
         self.app.weekly_threshold_pct = self._settings.weekly_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -125,6 +136,7 @@ class AutoScreen(Screen):
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
             self.app.threshold_pct = self._configured_threshold
+        self.app.weekly_threshold_pct = self._configured_weekly
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -148,13 +160,26 @@ class AutoScreen(Screen):
         return True
 
     def action_adjust_threshold(self) -> None:
-        if self._adjusting:
+        self._toggle_adjust("threshold")
+
+    def action_adjust_weekly(self) -> None:
+        self._toggle_adjust("weekly")
+
+    def _toggle_adjust(self, line: str) -> None:
+        if self._adjusting is not None:
+            current = self._adjusting
             self._end_adjust()
-            return
-        self._adjusting = True
-        self._entry_threshold = self._settings.threshold
+            if current == line:
+                return  # the same key again leaves the mode
+        self._adjusting = line
+        self._entry_value = self._line_value(line)
         self._update_summary()
         self.refresh_bindings()
+
+    def _line_value(self, line: str) -> float | None:
+        if line == "weekly":
+            return self._settings.weekly_threshold
+        return self._settings.threshold
 
     def action_adjust_done(self) -> None:
         if self._adjusting:
@@ -163,25 +188,103 @@ class AutoScreen(Screen):
     def action_threshold_step(self, delta: float) -> None:
         if not self._adjusting:
             return
+        if self._adjusting == "weekly":
+            spec = SETTING_SPECS["autoswitch.weeklyThreshold"]
+            # Unset, the weekly windows are judged at the threshold: the
+            # first step moves the line from where it already is.
+            current = self._settings.weekly_threshold
+            if current is None:
+                current = self._settings.threshold
+            self._set_weekly(min(spec.hi, max(spec.lo, current + delta)))
+            return
         spec = SETTING_SPECS["autoswitch.threshold"]
         value = min(spec.hi, max(spec.lo, self._settings.threshold + delta))
         self._set_threshold(value)
 
     def _end_adjust(self) -> None:
-        self._adjusting = False
+        line = self._adjusting
+        self._adjusting = None
         self._update_summary()
         self.refresh_bindings()
-        if self._settings.threshold == self._entry_threshold:
+        value = self._line_value(line)
+        if value == self._entry_value:
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
+        name = "weekly line" if line == "weekly" else "threshold"
+        self._log_note(f"— {name} set to {pct_label(value)}% for this session —")
+
+    def _log_note(self, message: str, *, role: str = "muted") -> None:
+        palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(
-            Text(
-                f"— threshold set to {pct_label(self._settings.threshold)}% "
-                "for this session —",
-                style=Palette.from_theme(self.app.current_theme).muted,
-            )
+            Text(message, style=getattr(palette, role))
         )
+
+    def _set_weekly(self, value: float) -> None:
+        if value == self._settings.weekly_threshold:
+            return
+        self._settings = replace(self._settings, weekly_threshold=value)
+        if self._engine is not None:
+            self._engine.apply_weekly_threshold(value)
+        self.app.weekly_threshold_pct = value
+        self.query_one("#auto-active-panel", AccountsPanel).refresh()
+        self._update_summary()
+        self._on_snapshot(self.app.snapshot)
+
+    # -- saving the lines -------------------------------------------------------
+
+    def _unsaved_lines(self) -> list[tuple[str, str, float]]:
+        """(dotted key, label, value) for each line that differs from the file."""
+        changed = []
+        if self._settings.threshold != self._configured_threshold:
+            changed.append(
+                ("autoswitch.threshold", "threshold", self._settings.threshold)
+            )
+        weekly = self._settings.weekly_threshold
+        if weekly is not None and weekly != self._configured_weekly:
+            changed.append(("autoswitch.weeklyThreshold", "weekly", weekly))
+        return changed
+
+    def action_save_lines(self) -> None:
+        if self._adjusting:
+            self._end_adjust()
+        changed = self._unsaved_lines()
+        if not changed:
+            self._log_note("— the lines in use are the saved ones; nothing to save —")
+            return
+        listed = " · ".join(f"{label} {pct_label(v)}%" for _k, label, v in changed)
+        self.app.push_screen(
+            ConfirmModal(
+                f"Save {listed} as the default in settings.json?\n\n"
+                "(Same as `cswap config set`. A `cswap auto` already running "
+                "keeps its lines until it is restarted.)",
+                title="Save lines",
+                yes_label="Save",
+            ),
+            self._on_save_confirm,
+        )
+
+    def _on_save_confirm(self, confirmed: bool | None) -> None:
+        if not confirmed:
+            return
+        saved: list[str] = []
+        for key, label, value in self._unsaved_lines():
+            try:
+                set_setting(self.app.switcher.backup_dir, key, pct_label(value))
+            except (ConfigError, OSError) as e:
+                self._log_note(f"— {label} not saved: {e} —", role="sev_warn")
+                continue
+            if key == "autoswitch.threshold":
+                self._configured_threshold = value
+            else:
+                self._configured_weekly = value
+            saved.append(f"{label} {pct_label(value)}%")
+        self._update_summary()
+        if saved:
+            self._log_note(
+                f"— saved {' · '.join(saved)} to settings.json; a running "
+                "`cswap auto` takes it up when restarted —"
+            )
 
     def _set_threshold(self, value: float) -> None:
         if value == self._settings.threshold:
@@ -203,14 +306,20 @@ class AutoScreen(Screen):
         text.append("auto-switch · ")
         text.append(
             f"threshold {pct_label(self._settings.threshold)}%",
-            style=palette.accent if self._adjusting else "",
+            style=palette.accent if self._adjusting == "threshold" else "",
         )
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
-        if self._settings.weekly_threshold is not None:
+        weekly = self._settings.weekly_threshold
+        if weekly is not None or self._adjusting == "weekly":
+            shown = pct_label(weekly) + "%" if weekly is not None else "= threshold"
+            text.append(" · ")
             text.append(
-                f" · weekly {pct_label(self._settings.weekly_threshold)}%"
+                f"weekly {shown}",
+                style=palette.accent if self._adjusting == "weekly" else "",
             )
+            if weekly != self._configured_weekly:
+                text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)

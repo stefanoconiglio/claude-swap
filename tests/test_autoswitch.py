@@ -7350,6 +7350,19 @@ class TestWeeklyThreshold:
         assert h.switcher._poll_inputs_override == (72.0, 97.0, ())
         assert h.engine.settings.weekly_threshold == 97.0
 
+    def test_apply_weekly_threshold_retargets_the_weekly_trigger(self, temp_home):
+        # 7d 98 is over the constructed weekly line (97): the engine leaves.
+        fleet = {"1": _usage7(5, 98), "2": _usage7(10, 10)}
+        assert self._harness(temp_home).tick_with_usage(fleet) is TickOutcome.SWITCHED
+        # With the session weekly line raised to 99 the same reading holds,
+        # the threshold stays, and poll planning follows the new line.
+        h = self._harness(temp_home)
+        h.engine.apply_weekly_threshold(99.0)
+        assert h.engine.settings.weekly_threshold == 99.0
+        assert h.engine.settings.threshold == 85.0
+        assert h.switcher._poll_inputs_override == (85.0, 99.0, ())
+        assert h.tick_with_usage(fleet) is not TickOutcome.SWITCHED
+
 
 def _header_usage(**windows) -> dict:
     """A setup-token header-probe reading (``source: headers``)."""

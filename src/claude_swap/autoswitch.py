@@ -2664,6 +2664,15 @@ class AutoSwitchEngine:
         state) are fixed at construction. The frozen-settings swap is atomic
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
+        self._retarget_poll_inputs()
+
+    def apply_weekly_threshold(self, weekly_threshold: float | None) -> None:
+        """Session override from the TUI for the weekly line (7d and
+        per-model windows); the same atomic swap as :meth:`apply_threshold`."""
+        self.settings = replace(self.settings, weekly_threshold=weekly_threshold)
+        self._retarget_poll_inputs()
+
+    def _retarget_poll_inputs(self) -> None:
         # Recomputed, not passed through: a per-account override may still be
         # lower than the new session global, and cadence follows the minimum.
         self.switcher.set_poll_policy_inputs(
