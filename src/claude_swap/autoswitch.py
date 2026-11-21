@@ -2285,10 +2285,24 @@ class AutoSwitchEngine:
                 )
             elif consume_first or (weekly_first and trigger == "proactive"):
                 # Soonest weekly reset first (unknown resets sort last), most
-                # policy headroom breaks ties, then sequence order. weekly-first
-                # keeps `best`'s headroom order for the at-limit and failover
-                # escapes, which may land on accounts over their lines.
+                # policy headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+            elif weekly_first and trigger in ("at-limit", "failover"):
+                # The escapes skip the landing gate and its hysteresis, so a
+                # soonest-reset pick could land on an account a point under
+                # its line. They take the soonest weekly reset only among
+                # accounts under every line with at least `hysteresis_pct`
+                # points of policy headroom; the rest follow, by `best`'s
+                # most-room order, and are picked only when none has that
+                # margin.
+                if not over and lh >= settings.hysteresis_pct:
+                    key = (
+                        0,
+                        reset_ts if reset_ts is not None else float("inf"),
+                        -lh,
+                    )
+                else:
+                    key = (1, 0.0, -lh)
             else:
                 key = (-lh,)
             qualifying.append((key, num))

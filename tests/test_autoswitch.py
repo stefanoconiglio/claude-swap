@@ -3473,23 +3473,75 @@ class TestWeeklyFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_at_limit_escape_ranks_like_best(self, temp_home):
+    def test_at_limit_escape_skips_a_sooner_reset_over_its_line(self, temp_home):
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage7(100, 50, _R_LATER),
             "2": _usage7(97, 50, _R_SOON),     # over the line, resets first
-            "3": _usage7(60, 50, _R_LATEST),   # most room
+            "3": _usage7(60, 50, _R_LATEST),   # the only one under the line
         })
         assert outcome is TickOutcome.SWITCHED
         assert self._switch(h).trigger == "at-limit"
         assert h.active_number() == 3
 
-    def test_failover_ranks_like_best(self, temp_home):
+    def test_at_limit_escape_takes_the_soonest_reset_with_room(self, temp_home):
+        h = self._harness(temp_home, n=4)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(50, 40, _R_SOON),     # less room, weekly resets first
+            "3": _usage7(10, 10, _R_LATEST),   # most room (best's pick)
+            "4": _usage7(30, 30, _R_LATER),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert self._switch(h).trigger == "at-limit"
+        assert h.active_number() == 2
+
+    def test_at_limit_escape_needs_the_margin_for_the_soonest_reset(
+        self, temp_home
+    ):
+        """Line 99: #2 is under it but has 5 points, under the 10-point
+        margin, so the soonest reset among the others with the margin wins."""
+        h = self._harness(temp_home, n=4, threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(95, 40, _R_SOON),     # resets first, only 5 pts
+            "3": _usage7(20, 20, _R_LATEST),   # most room
+            "4": _usage7(70, 30, _R_LATER),    # 30 pts, resets before #3
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+
+    def test_at_limit_escape_falls_back_to_the_most_room(self, temp_home):
+        """No candidate has the margin: `best`'s most-room order decides."""
+        h = self._harness(temp_home, threshold=99.0)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100, 50, _R_LATER),
+            "2": _usage7(95, 40, _R_SOON),     # 5 pts, resets first
+            "3": _usage7(92, 40, _R_LATEST),   # 8 pts
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert self._switch(h).trigger == "at-limit"
+        assert h.active_number() == 3
+
+    def test_failover_takes_the_soonest_reset_with_room(self, temp_home):
         h = self._harness(temp_home)
         usage = {
             "1": None,
             "2": _usage7(50, 40, _R_SOON),
-            "3": _usage7(10, 10, _R_LATEST),
+            "3": _usage7(10, 10, _R_LATEST),   # most room (best's pick)
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert self._switch(h).trigger == "failover"
+        assert h.active_number() == 2
+
+    def test_failover_falls_back_to_the_most_room(self, temp_home):
+        h = self._harness(temp_home, threshold=99.0)
+        usage = {
+            "1": None,
+            "2": _usage7(95, 40, _R_SOON),     # 5 pts, resets first
+            "3": _usage7(92, 40, _R_LATEST),   # 8 pts
         }
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
         assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
